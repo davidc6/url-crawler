@@ -7,15 +7,11 @@ use tokio::task::JoinSet;
 use url_crawler::{
     data_store::{DataStore, Store},
     fetch::{Fetch, HttpFetch},
-    link::{filter_url, process_url, url_parts},
-    parser::Parser,
-    url_frontier::{URLFrontier, URLFrontierBuilder, URLFrontierable},
+    link::url_parts,
+    task::run_task,
+    task::Dependencies,
+    url_frontier::URLFrontierBuilder,
 };
-
-struct Dependencies {
-    url_frontier: Arc<RwLock<URLFrontier>>,
-    data_store: Arc<RwLock<Store>>,
-}
 
 #[derive(ClapParser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -37,73 +33,33 @@ struct Args {
     print: bool,
 }
 
-async fn execute(cli_args: Args, dependencies: Dependencies) -> Result<Arc<RwLock<Store>>, Error> {
+async fn execute(
+    cli_args: Args,
+    dependencies: Dependencies,
+) -> Result<Arc<RwLock<dyn DataStore + Send>>, Error> {
     let Args { url, workers_n, .. } = cli_args;
     let Dependencies {
         url_frontier,
         data_store,
     } = dependencies;
-
     let original_url_parts = Arc::new(url_parts(&url));
     let mut tasks = JoinSet::new();
 
-    for _ in 0..workers_n {
-        let url_frontier = url_frontier.clone();
-        let data_store = data_store.clone();
-        let urls_parts = original_url_parts.clone();
+    let dependencies = Arc::new(Dependencies {
+        url_frontier,
+        data_store: data_store.clone(),
+    });
 
+    for _n in 0..workers_n {
         let client: HttpFetch = Fetch::new(); // a HTTP client per worker
-        let mut is_initial_crawl = true; // if multi-threaded, threads won't quit after the initial single URL crawl
+        let is_initial_crawl = true; // if multi-threaded, threads won't quit after the initial single URL crawl
 
-        let task = tokio::spawn(async move {
-            loop {
-                let mut url_frontier_write = url_frontier.write().await;
-                let url = url_frontier_write.dequeue().await;
-                let current_url = match url {
-                    Some(val) => val,
-                    None => return,
-                };
-
-                let mut data_store_write = data_store.write().await;
-                if data_store_write.has_visited(&current_url) {
-                    continue;
-                }
-
-                info!("Visiting URL: {}", current_url);
-
-                let content = match client.get(&current_url).await {
-                    Ok(val) => val,
-                    Err(e) => {
-                        warn!("Error requesting URL {} - {}", current_url, e);
-                        continue;
-                    }
-                };
-
-                data_store_write.add(current_url.clone(), None);
-                data_store_write.visited(&current_url);
-
-                let urls_found = Parser::new(content).all_links();
-                for url in urls_found {
-                    let url = process_url(url, &current_url);
-                    info!("Found URL: {}", url);
-
-                    data_store_write.add(current_url.clone(), Some(url.clone()));
-
-                    if let Some(url) = filter_url(url, urls_parts.clone()) {
-                        if !data_store_write.has_visited(&url) {
-                            url_frontier_write.enqueue(url);
-                        }
-                    };
-                }
-
-                info!("--------------------------------------------");
-
-                if is_initial_crawl {
-                    is_initial_crawl = false;
-                    continue;
-                }
-            }
-        });
+        let task = tokio::spawn(run_task(
+            dependencies.clone(),
+            client,
+            original_url_parts.clone(),
+            is_initial_crawl,
+        ));
 
         tasks.spawn(task);
     }
@@ -117,7 +73,9 @@ async fn execute(cli_args: Args, dependencies: Dependencies) -> Result<Arc<RwLoc
 
 #[tokio::main]
 async fn main() {
-    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(Env::default().default_filter_or("info"))
+        .format_timestamp(None)
+        .init();
 
     let cli_args = Args::parse();
     let should_print_results = cli_args.print;
@@ -128,7 +86,7 @@ async fn main() {
             .delay_s(cli_args.delay)
             .build(),
     ));
-    let data_store = Arc::new(RwLock::new(DataStore::new()));
+    let data_store = Arc::new(RwLock::new(Store::new()));
     let dependencies = Dependencies {
         url_frontier,
         data_store,
@@ -140,19 +98,19 @@ async fn main() {
 
             if should_print_results {
                 let data_store_read = val.read().await;
-                println!("{:?}", *data_store_read);
+                println!("{:?}", data_store_read);
             }
         }
         Err(e) => {
             warn!("There's been an error: {}", e);
         }
-    };
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::{execute, Args, Dependencies};
     use std::sync::Arc;
-
     use tokio::sync::RwLock;
     use url_crawler::{
         data_store::{DataStore, Store},
@@ -162,8 +120,6 @@ mod tests {
         matchers::{method, path},
         Mock, MockServer, ResponseTemplate,
     };
-
-    use crate::{execute, Args, Dependencies};
 
     fn make_hrefs(base_uri: &str) -> Vec<String> {
         let url1 = format!("{}/about", &base_uri);
@@ -180,30 +136,49 @@ mod tests {
             .join("")
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn test_execute() {
+    #[tokio::test]
+    async fn execute_populates_data_store_as_expected() {
         //  --- arrange
         let mock_server = MockServer::start().await;
-        let mock_server_uri = mock_server.uri();
-        let hrefs = make_hrefs(&mock_server_uri);
+        let port = mock_server.address().port();
+        let test_url = format!("http://localhost:{}", port);
+        let hrefs = make_hrefs(&test_url);
         let anchors = make_anchors(hrefs.to_vec());
 
-        // mock http requests
         let response = ResponseTemplate::new(200).set_body_string(anchors);
         Mock::given(method("GET"))
             .and(path("/"))
-            .respond_with(response)
+            .respond_with(response.clone())
+            .up_to_n_times(1)
+            .expect(1..)
+            .mount(&mock_server)
+            .await;
+
+        let response = ResponseTemplate::new(200).set_body_string("");
+        Mock::given(method("GET"))
+            .and(path("/about"))
+            .respond_with(response.clone())
+            .up_to_n_times(1)
+            .expect(1..)
+            .mount(&mock_server)
+            .await;
+
+        let response = ResponseTemplate::new(200).set_body_string("");
+        Mock::given(method("GET"))
+            .and(path("/contact"))
+            .respond_with(response.clone())
+            .up_to_n_times(1)
+            .expect(1..)
             .mount(&mock_server)
             .await;
 
         let cli_args = Args {
-            url: mock_server.uri().to_owned(),
+            url: test_url.to_owned(),
             workers_n: 1,
             delay: 0,
             print: false,
         };
 
-        // dependencies
         let url_frontier = Arc::new(RwLock::new(
             URLFrontierBuilder::new()
                 .value(cli_args.url.to_owned())
@@ -211,29 +186,33 @@ mod tests {
                 .build(),
         ));
         let data_store = Arc::new(RwLock::new(Store::new()));
+
+        let mut data_store_raw = Store::new();
+        for url in make_hrefs(&test_url) {
+            data_store_raw.add(test_url.to_owned(), Some(url.clone()));
+            data_store_raw.visited(&test_url);
+        }
+
+        data_store_raw.add(hrefs[0].clone(), None);
+        data_store_raw.visited(&hrefs[0]);
+
+        data_store_raw.add(hrefs[1].clone(), None);
+        data_store_raw.visited(&hrefs[1]);
+
+        let expected_data_store = Arc::new(RwLock::new(data_store_raw));
+
         let dependencies = Dependencies {
             url_frontier,
-            data_store,
+            data_store: data_store.clone(),
         };
 
         // --- act
-        let actual = execute(cli_args, dependencies).await;
-        let data_store = actual.unwrap();
-        let actual = data_store.read().await;
+        let _ = execute(cli_args, dependencies).await;
 
         // --- assert
-        let mut expected = Store::new();
-        for url in make_hrefs(&mock_server_uri) {
-            expected.add(mock_server_uri.to_owned(), Some(url.clone()));
-            expected.visited(&mock_server_uri);
-        }
+        let actual = data_store.read().await;
+        let expected = expected_data_store.read().await;
 
-        expected.add(hrefs[0].clone(), None);
-        expected.visited(&hrefs[0]);
-
-        expected.add(hrefs[1].clone(), None);
-        expected.visited(&hrefs[1]);
-
-        assert_eq!(expected, *actual);
+        assert_eq!(*expected, *actual);
     }
 }

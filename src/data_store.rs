@@ -1,4 +1,7 @@
+use mockall::predicate::*;
+use mockall::*;
 use std::collections::HashMap;
+use std::fmt::Debug;
 
 #[derive(Debug, PartialEq)]
 pub struct DataStoreEntry {
@@ -6,13 +9,13 @@ pub struct DataStoreEntry {
     pub urls_found: Vec<String>,
 }
 
-pub trait DataStore {
-    fn new() -> Self;
+#[automock]
+pub trait DataStore: Debug {
     fn add(&mut self, key: String, value: Option<String>);
     fn visited(&mut self, key: &str);
     fn has_visited(&self, key: &str) -> bool;
     fn exists(&self, key: &str) -> bool;
-    fn get(&self, key: &str) -> Option<&DataStoreEntry>;
+    fn get<'a>(&'a self, key: &str) -> Option<&'a DataStoreEntry>;
 }
 
 #[derive(Debug, PartialEq)]
@@ -20,13 +23,21 @@ pub struct Store {
     data: HashMap<String, DataStoreEntry>,
 }
 
-impl DataStore for Store {
-    fn new() -> Self {
+impl Default for Store {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Store {
+    pub fn new() -> Self {
         Store {
             data: HashMap::<String, DataStoreEntry>::new(),
         }
     }
+}
 
+impl DataStore for Store {
     fn add(&mut self, key: String, value: Option<String>) {
         let item = self.data.get_mut(&key);
 
@@ -60,7 +71,7 @@ impl DataStore for Store {
         false
     }
 
-    fn get(&self, key: &str) -> Option<&DataStoreEntry> {
+    fn get<'a>(&'a self, key: &str) -> Option<&'a DataStoreEntry> {
         self.data.get(key)
     }
 

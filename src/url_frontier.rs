@@ -1,10 +1,17 @@
+use async_trait::async_trait;
 use crossbeam_queue::SegQueue;
 use std::{sync::Arc, time::Duration};
 use tokio::time::sleep;
 
-pub trait URLFrontierable {
+pub trait Queue: Enqueue + Dequeue {}
+
+#[async_trait]
+pub trait Dequeue {
+    async fn dequeue(&mut self) -> Option<String>;
+}
+
+pub trait Enqueue {
     fn enqueue(&mut self, value: String);
-    fn dequeue(&mut self) -> impl std::future::Future<Output = Option<String>> + Send;
 }
 
 #[derive(Default)]
@@ -13,16 +20,34 @@ pub struct URLFrontier {
     delay_s: Option<u64>,
 }
 
+impl Queue for URLFrontier {}
+
+#[async_trait]
+impl Dequeue for URLFrontier {
+    async fn dequeue(&mut self) -> Option<String> {
+        if let Some(delay_s) = self.delay_s {
+            sleep(Duration::from_secs(delay_s)).await;
+        }
+        self.queue.pop()
+    }
+}
+
+impl Enqueue for URLFrontier {
+    fn enqueue(&mut self, value: String) {
+        self.queue.push(value)
+    }
+}
+
 #[derive(Default)]
 pub struct URLFrontierBuilder {
-    queue: Arc<SegQueue<String>>,
+    queue: SegQueue<String>,
     delay_s: Option<u64>,
 }
 
 impl URLFrontierBuilder {
     pub fn new() -> URLFrontierBuilder {
         URLFrontierBuilder {
-            queue: Arc::new(SegQueue::new()),
+            queue: SegQueue::new(),
             delay_s: None,
         }
     }
@@ -41,29 +66,17 @@ impl URLFrontierBuilder {
 
     pub fn build(self) -> URLFrontier {
         URLFrontier {
-            queue: self.queue,
+            queue: self.queue.into(),
             delay_s: self.delay_s,
         }
     }
 }
 
-impl URLFrontierable for URLFrontier {
-    async fn dequeue(&mut self) -> Option<String> {
-        if let Some(delay_s) = self.delay_s {
-            sleep(Duration::from_secs(delay_s)).await;
-        }
-        self.queue.pop()
-    }
-
-    fn enqueue(&mut self, value: String) {
-        self.queue.push(value)
-    }
-}
-
 #[cfg(test)]
 mod url_frontier_tests {
+    use super::Dequeue;
+    use super::Enqueue;
     use super::URLFrontierBuilder;
-    use super::URLFrontierable;
 
     #[test]
     fn url_frontier_builder_builds_url_frontier() {

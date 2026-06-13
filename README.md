@@ -64,3 +64,16 @@ Additional cli options can be provided:
 - Better handling of domain specific politeness / delay
 - Provide an abstraction to write output to a file
 - Environment dependent logger
+- Have a go at wiring up [libfaketime](https://github.com/wolfcw/libfaketime) or [fluxcapacitor](https://github.com/majek/fluxcapacitor#fluxcapacitor) to mock system time for tests
+
+## Version 0.2.0 changelog
+
+- Task/thread logic moved into a separate module to better/easier unit testing
+- Integration test moved into a separate directory to make it separate from the rest of binary
+- Logging is now without timestamp (to allow for cleaner testing for now)
+- Store and URLFrontier are now passed in as trait objects so we are coding to interface and not implementation
+- Store and URLFrontier traits are mocked for testing purposes
+- URLFrontier split into two traits (sync and async) in order to enable mocking
+- Improved tests (main.rs)
+- task.rs contains a sequential steps test that makes sure that the sequence of calls is correct
+- Address parsing now works ok with localhost instead of 127.0.0.1 (previously it could not parse TLD)
